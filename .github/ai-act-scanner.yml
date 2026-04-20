@@ -1,0 +1,196 @@
+name: EU AI Act Compliance Scan
+
+# Runs the open-source compl-ai framework (https://github.com/compl-ai/compl-ai)
+# against the repository / target model to evaluate obligations under
+# Regulation (EU) 2024/1689 (the AI Act): technical robustness, transparency,
+# data governance, non-discrimination, privacy, human oversight and
+# cybersecurity. Demo configuration — tune benchmarks & thresholds per use case.
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  schedule:
+    # Weekly scan every Monday at 06:00 UTC so dormant repos stay in scope.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      model_id:
+        description: "HuggingFace model id (or local path) to evaluate"
+        required: false
+        default: "gpt2"
+      risk_tier:
+        description: "Declared AI system risk tier"
+        required: false
+        default: "high-risk"
+        type: choice
+        options:
+          - prohibited
+          - high-risk
+          - limited-risk
+          - minimal-risk
+          - gpai
+      fail_on_severity:
+        description: "Minimum finding severity that should fail the build"
+        required: false
+        default: "high"
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+          - critical
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+  actions: read
+
+concurrency:
+  group: ai-act-compliance-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHON_VERSION: "3.11"
+  COMPL_AI_REF: "main"                       # pin to a tag/commit for reproducibility
+  SCAN_OUTPUT_DIR: ${{ github.workspace }}/ai-act-report
+  MODEL_ID: ${{ inputs.model_id || 'gpt2' }}
+  RISK_TIER: ${{ inputs.risk_tier || 'high-risk' }}
+  FAIL_ON_SEVERITY: ${{ inputs.fail_on_severity || 'high' }}
+
+jobs:
+  compliance-scan:
+    name: AI Act Compliance Scan (compl-ai)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Clone compl-ai framework
+        uses: actions/checkout@v4
+        with:
+          repository: compl-ai/compl-ai
+          ref: ${{ env.COMPL_AI_REF }}
+          path: .compl-ai
+
+      - name: Install compl-ai
+        working-directory: .compl-ai
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          # Optional extras used by some benchmarks.
+          pip install fairlearn transformers datasets
+
+      - name: Prepare output directory
+        run: mkdir -p "${SCAN_OUTPUT_DIR}"
+
+      - name: Run compl-ai benchmarks
+        id: scan
+        continue-on-error: true
+        working-directory: .compl-ai
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}           # optional, for gated models
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }} # optional, for API models
+        run: |
+          # The compl-ai CLI pattern:
+          #   python run.py --model_config <cfg> --benchmark_config <cfg>
+          # Here we pass overrides inline so this workflow runs stand-alone.
+          python run.py \
+            --model "${MODEL_ID}" \
+            --model_provider huggingface \
+            --benchmarks all \
+            --risk_tier "${RISK_TIER}" \
+            --results_dir "${SCAN_OUTPUT_DIR}" \
+            --export_formats json,sarif,html,markdown \
+            --fail_on_severity "${FAIL_ON_SEVERITY}"
+
+      - name: Generate step summary
+        if: always()
+        run: |
+          {
+            echo "## EU AI Act Compliance Report"
+            echo ""
+            echo "- **Model**: \`${MODEL_ID}\`"
+            echo "- **Declared risk tier**: ${RISK_TIER}"
+            echo "- **Fail-on threshold**: ${FAIL_ON_SEVERITY}"
+            echo "- **Scanner**: [compl-ai](https://github.com/compl-ai/compl-ai) @ ${COMPL_AI_REF}"
+            echo ""
+            if [ -f "${SCAN_OUTPUT_DIR}/summary.md" ]; then
+              cat "${SCAN_OUTPUT_DIR}/summary.md"
+            else
+              echo "_No summary.md produced by the scanner — see the uploaded artifact for raw results._"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload SARIF results to GitHub code scanning
+        if: always() && hashFiles(format('{0}/results.sarif', env.SCAN_OUTPUT_DIR)) != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.SCAN_OUTPUT_DIR }}/results.sarif
+          category: ai-act-compliance
+
+      - name: Upload compliance report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-act-compliance-report-${{ github.run_id }}
+          path: ${{ env.SCAN_OUTPUT_DIR }}/
+          retention-days: 90
+
+      - name: Comment findings on pull request
+        if: always() && github.event_name == 'pull_request' && hashFiles(format('{0}/summary.md', env.SCAN_OUTPUT_DIR)) != ''
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: ai-act-compliance
+          path: ${{ env.SCAN_OUTPUT_DIR }}/summary.md
+
+      - name: Enforce scan exit code
+        if: always()
+        run: |
+          if [ "${{ steps.scan.outcome }}" != "success" ]; then
+            echo "::error title=AI Act Compliance::compl-ai reported findings at or above severity '${FAIL_ON_SEVERITY}'."
+            exit 1
+          fi
+
+  documentation-check:
+    name: Technical Documentation Check (Annex IV)
+    runs-on: ubuntu-latest
+    needs: compliance-scan
+    if: always()
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify required AI Act documentation is present
+        run: |
+          required_files=(
+            "docs/ai-act/technical-documentation.md"
+            "docs/ai-act/risk-management.md"
+            "docs/ai-act/data-governance.md"
+            "docs/ai-act/human-oversight.md"
+            "docs/ai-act/post-market-monitoring.md"
+            "MODEL_CARD.md"
+          )
+          missing=0
+          for f in "${required_files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::warning file=$f::Missing AI Act documentation artefact: $f"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -gt 0 ]; then
+            echo "::error::$missing AI Act documentation artefact(s) missing."
+            exit 1
+          fi
